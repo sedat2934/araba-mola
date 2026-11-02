@@ -94,6 +94,8 @@ android {
 
             dependencies {
                 implementation files('lib/auto/aauto.aar')
+                // Xposed API yalnizca derleme icin (cerceve runtime'da saglar).
+                compileOnly files('lib/auto/xposed-api-82.jar')
             }
         }
     }

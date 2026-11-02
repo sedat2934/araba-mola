@@ -441,38 +441,15 @@ public class MirrorDisplay {
 		}
 		if (sc == null) noSession();
 		if (p.isDone()) return;
-		ProjectionService.start().onCompletion((mp, err) -> {
-			if ((session != p) || !runtimeActive()) {
-				if (mp != null) mp.stop();
-				return;
-			}
-			if (sc == null) noSession();
-			if (p.isDone()) return;
-			if (err != null) {
-				if (isCancellation(err)) {
-					drawMsg(R.string.screen_capture_rejected);
-					cleanUp();
-					return;
-				}
-				Log.e(err, "Failed to create media projection");
-				retryCreateSession(p);
-			} else if (mp == null) {
-				Log.e("Failed to create media projection");
-				retryCreateSession(p);
-			} else {
-				try {
-					p.complete(new Session(mp, this));
-				} catch (Exception ex) {
-					Log.e(ex, "Failed to create media projection");
-					try {
-						mp.stop();
-					} catch (RuntimeException stopError) {
-						Log.d(stopError, "Failed to discard incomplete media projection");
-					}
-					retryCreateSession(p);
-				}
-			}
-		});
+		// Torque yontemi: MediaProjection yerine dogrudan guvenilir (trusted) sanal ekran.
+		// Izin ekrani ("Simdi baslat") cikmaz. Xposed system_server kancasi, uygulamaya
+		// ADD_TRUSTED_DISPLAY iznini verir; ekran OWN_DISPLAY_GROUP + ALWAYS_UNLOCKED olur.
+		try {
+			p.complete(new Session(this));
+		} catch (Exception ex) {
+			Log.e(ex, "Failed to create trusted virtual display");
+			retryCreateSession(p);
+		}
 	}
 
 	private void retryCreateSession(Promise<Session> p) {
@@ -590,50 +567,39 @@ public class MirrorDisplay {
 		}
 	}
 
-	private static final class Session extends MediaProjection.Callback {
-		final MediaProjection mp;
+	private static final class Session {
+		// Torque tarzi gizli bayraklar (DisplayManager public sabitleri bunlari icermez):
+		private static final int FLAG_OWN_CONTENT_ONLY = 1 << 3;   // 8
+		private static final int FLAG_SUPPORTS_TOUCH = 1 << 6;     // 64
+		private static final int FLAG_TRUSTED = 1 << 10;           // 1024
+		private static final int FLAG_OWN_DISPLAY_GROUP = 1 << 11; // 2048
+		private static final int FLAG_ALWAYS_UNLOCKED = 1 << 12;   // 4096
+		private static final int FLAGS = FLAG_OWN_CONTENT_ONLY | FLAG_SUPPORTS_TOUCH
+				| FLAG_TRUSTED | FLAG_OWN_DISPLAY_GROUP | FLAG_ALWAYS_UNLOCKED;
+
 		final VirtualDisplay vd;
 		final WeakReference<MirrorDisplay> mdRef;
 		final AtomicBoolean closed = new AtomicBoolean();
 
-		Session(MediaProjection mp, MirrorDisplay md) {
-			this.mp = mp;
+		Session(MirrorDisplay md) {
 			this.mdRef = new WeakReference<>(md);
 			var sc = md.sc;
 			var app = FermataApplication.get();
 			var name = app.getString(R.string.mirror_service_name);
-			mp.registerCallback(this, app.getHandler());
-			vd = mp.createVirtualDisplay(name, sc.getWidth(), sc.getHeight(), sc.getDpi(),
-					DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY, sc.getSurface(), null, null);
+			var dm = (DisplayManager) app.getSystemService(Context.DISPLAY_SERVICE);
+			if (dm == null) throw new RuntimeException("DisplayManager unavailable");
+			vd = dm.createVirtualDisplay(name, sc.getWidth(), sc.getHeight(), sc.getDpi(),
+					sc.getSurface(), FLAGS);
 			if (vd == null) throw new RuntimeException("Failed to create VirtualDisplay");
-			Log.i("VirtualDisplay created");
-		}
-
-		@Override
-		public void onStop() {
-			close();
-			var md = mdRef.get();
-			if (md == null) return;
-			Log.i("Media projection stopped");
-			md.cleanUp();
+			Log.i("Trusted VirtualDisplay created, id=", vd.getDisplay().getDisplayId());
 		}
 
 		void close() {
 			if (!closed.compareAndSet(false, true)) return;
 			try {
-				mp.unregisterCallback(this);
-			} catch (Throwable error) {
-				Log.d(error, "Failed to unregister media projection callback");
-			}
-			try {
 				vd.release();
 			} catch (Throwable error) {
 				Log.d(error, "Failed to release virtual display");
-			}
-			try {
-				mp.stop();
-			} catch (Throwable error) {
-				Log.d(error, "Failed to stop media projection");
 			}
 		}
 	}

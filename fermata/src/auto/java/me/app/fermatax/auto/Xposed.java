@@ -46,7 +46,11 @@ import androidx.annotation.NonNull;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+import android.os.Binder;
 
 /**
  * @author Andrey Pavlenko
@@ -58,6 +62,8 @@ public class Xposed implements IXposedHookLoadPackage {
 	private static final String PKG_MGR_CLASS = "android.content.pm.IPackageManager.Stub.Proxy";
 	private static final String DISPATCHER_CLASS_NAME =
 			"me.app.fermatax.auto.XposedEventDispatcherService";
+
+	private volatile int molaUid = -1;
 
 	@Override
 	public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -83,6 +89,11 @@ public class Xposed implements IXposedHookLoadPackage {
 							}
 						});
 			}
+			return;
+		}
+
+		if ("android".equals(pkgName)) {
+			hookSystemServer(lpparam.classLoader);
 			return;
 		}
 
@@ -147,6 +158,115 @@ public class Xposed implements IXposedHookLoadPackage {
 				handleIntent(a, intent);
 			}
 		});
+	}
+
+	// system_server (android): Torque yontemi icin cerceve kancalari.
+	// Mola'ya guvenilir ekran olusturma izni verir ve ikincil ekrandaki uygulamalarin
+	// kilit ekraninda calismasini saglar. Kapsam (scope) "android" olmali.
+	private void hookSystemServer(ClassLoader cl) {
+		// 1) DisplayManagerService.checkCallingPermission -> Mola/root/shell icin ADD_TRUSTED_DISPLAY ver.
+		try {
+			Class<?> dms = XposedHelpers.findClass("com.android.server.display.DisplayManagerService", cl);
+			int n = XposedBridge.hookAllMethods(dms, "checkCallingPermission", new XC_MethodHook() {
+				@Override
+				protected void beforeHookedMethod(MethodHookParam param) {
+					if ((param.args == null) || (param.args.length < 1)) return;
+					Object a0 = param.args[0];
+					if (!(a0 instanceof String)) return;
+					String perm = (String) a0;
+					if (!perm.equals("android.permission.ADD_TRUSTED_DISPLAY")
+							&& !perm.equals("android.permission.ADD_ALWAYS_UNLOCKED_DISPLAY")) return;
+					int uid = Binder.getCallingUid();
+					if (isMolaUid(uid) || (uid == 0) || (uid == 2000)) param.setResult(true);
+				}
+			}).size();
+			log("[Fermata] checkCallingPermission hooks=" + n);
+		} catch (Throwable t) {
+			log("[Fermata] checkCallingPermission hook failed: " + t);
+		}
+
+		// 2) VirtualDisplayAdapter.isNeverBlank -> trusted + own_group ekran kilitte kararmasin.
+		try {
+			Class<?> vda = XposedHelpers.findClass("com.android.server.display.VirtualDisplayAdapter", cl);
+			XposedBridge.hookAllMethods(vda, "isNeverBlank", new XC_MethodHook() {
+				@Override
+				protected void beforeHookedMethod(MethodHookParam param) {
+					if ((param.args == null) || (param.args.length < 1)) return;
+					Object a0 = param.args[0];
+					if (!(a0 instanceof Integer)) return;
+					int f = (Integer) a0;
+					// TRUSTED(1024) + OWN_DISPLAY_GROUP(2048), AUTO_MIRROR(16) degil.
+					if (((f & 1024) != 0) && ((f & 2048) != 0) && ((f & 16) == 0)) param.setResult(true);
+				}
+			});
+		} catch (Throwable t) {
+			log("[Fermata] isNeverBlank hook failed: " + t);
+		}
+
+		// 3) ActivityRecord: ikincil ekrandaki (displayId != 0) uygulamalar kilitte gorunsun,
+		//    relaunch olmasin.
+		try {
+			final Class<?> ar = XposedHelpers.findClass("com.android.server.wm.ActivityRecord", cl);
+			XC_MethodHook showHook = new XC_MethodHook() {
+				@Override
+				protected void afterHookedMethod(MethodHookParam param) {
+					if (Boolean.TRUE.equals(param.getResult())) return;
+					Object rec = pickActivityRecord(param, ar);
+					if ((rec != null) && (displayIdOf(rec) > 0)) param.setResult(Boolean.TRUE);
+				}
+			};
+			int s = XposedBridge.hookAllMethods(ar, "canShowWhenLocked", showHook).size();
+			s += XposedBridge.hookAllMethods(ar, "canShowWhenLockedInner", showHook).size();
+			XposedBridge.hookAllMethods(ar, "shouldRelaunchLocked", new XC_MethodHook() {
+				@Override
+				protected void afterHookedMethod(MethodHookParam param) {
+					if (Boolean.FALSE.equals(param.getResult())) return;
+					Object rec = pickActivityRecord(param, ar);
+					if (rec == null) rec = param.thisObject;
+					if ((rec != null) && ar.isInstance(rec) && (displayIdOf(rec) > 0)) {
+						param.setResult(Boolean.FALSE);
+					}
+				}
+			});
+			log("[Fermata] canShowWhenLocked hooks=" + s);
+		} catch (Throwable t) {
+			log("[Fermata] lock-screen hook failed: " + t);
+		}
+
+		log("[Fermata] system_server hooks installed");
+	}
+
+	private boolean isMolaUid(int uid) {
+		if (uid < 10000) return false;
+		if (molaUid >= 0) return uid == molaUid;
+		try {
+			Object pm = XposedHelpers.callStaticMethod(Class.forName("android.app.AppGlobals"), "getPackageManager");
+			Object name = XposedHelpers.callMethod(pm, "getNameForUid", uid);
+			if (APPLICATION_ID.equals(name)) {
+				molaUid = uid;
+				return true;
+			}
+			return false;
+		} catch (Throwable t) {
+			return false;
+		}
+	}
+
+	private static Object pickActivityRecord(XC_MethodHook.MethodHookParam param, Class<?> ar) {
+		if ((param.thisObject != null) && ar.isInstance(param.thisObject)) return param.thisObject;
+		if (param.args != null) {
+			for (Object a : param.args) if ((a != null) && ar.isInstance(a)) return a;
+		}
+		return null;
+	}
+
+	private static int displayIdOf(Object activityRecord) {
+		try {
+			Object r = XposedHelpers.callMethod(activityRecord, "getDisplayId");
+			if (r instanceof Integer) return (Integer) r;
+		} catch (Throwable ignored) {
+		}
+		return -1;
 	}
 
 	private static void register(Activity a) {

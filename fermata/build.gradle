@@ -97,14 +97,8 @@ android {
             }
         }
     }
-    // The dashboard uses InlineMirrorView + Android MediaProjection consent. Legacy
-    // root/input injection and Xposed code are retained as history, never compiled into APKs.
-    sourceSets.auto.java {
-        exclude '**/AccessibilityEventDispatcherService.java', '**/XposedEventDispatcherService.java',
-                '**/Xposed.java', '**/Su.java', '**/EventDispatcher.java',
-                '**/MirrorDisplay.java', '**/MirrorActivity.java', '**/MirrorService.java',
-                '**/MirrorServiceFS.java', '**/LauncherActivity.java'
-    }
+    // Bagimsiz ekran (OWN_CONTENT_ONLY) + root/Xposed dokunma yolu yeniden derleniyor.
+    // Kisisel rootlu kullanim icin; Play Protect/bankacilik kabulu hedeflenmez.
 
     packagingOptions {
         resources {
